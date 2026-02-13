@@ -110,13 +110,15 @@ function handleMessage(msg) {
     const p = state.pending[msg.id];
     if (p) {
       delete state.pending[msg.id];
-      if (msg.type === 'err' || msg.error) {
+      if (msg.type === 'err' || msg.error || msg.ok === false) {
         p.reject(new Error(msg.error?.message || msg.message || 'request failed'));
       } else {
-        p.resolve(msg.result ?? msg.payload ?? msg);
+        p.resolve(msg.payload ?? msg.result ?? msg);
       }
     }
   } else if (msg.type === 'event') {
+    // Skip connect.challenge events (handled by protocol)
+    if (msg.event === 'connect.challenge') return;
     handleEvent(msg);
   } else if (msg.type === 'stream') {
     handleStream(msg);
@@ -124,14 +126,88 @@ function handleMessage(msg) {
 }
 
 function handleEvent(msg) {
-  // Handle real-time events if needed
   const evt = msg.event;
+  const data = msg.payload || msg.data;
+  
+  if (evt === 'chat') {
+    handleChatEvent(data);
+    return;
+  }
+  
   if (evt === 'session.message' || evt === 'chat.message') {
-    // A new message arrived for current session
-    if (msg.data?.sessionKey === state.selectedSessionKey) {
-      appendMessageFromEvent(msg.data);
+    if (data?.sessionKey === state.selectedSessionKey) {
+      appendMessageFromEvent(data);
     }
   }
+}
+
+function handleChatEvent(data) {
+  if (!data) return;
+  
+  // Track session key from response
+  if (data.sessionKey && state.chatStreaming) {
+    state.selectedSessionKey = data.sessionKey;
+  }
+  
+  // Check if this event is for our session
+  // Allow if no session key filter or if it matches
+  if (data.sessionKey && state.selectedSessionKey && 
+      data.sessionKey !== state.selectedSessionKey) {
+    return;
+  }
+  
+  // Check runId if we have one
+  if (data.runId && state.chatRunId && data.runId !== state.chatRunId) {
+    if (data.state === 'final') return;
+    return;
+  }
+  
+  if (data.state === 'delta') {
+    const text = extractMessageText(data.message);
+    if (typeof text === 'string') {
+      const current = state.streamingText || '';
+      if (!current || text.length >= current.length) {
+        state.streamingText = text;
+      }
+      updateStreamingMessage();
+    }
+  } else if (data.state === 'final') {
+    state.chatStreaming = false;
+    state.chatRunId = null;
+    finalizeStreamingMessage();
+    // Reload full history to get the complete message
+    if (state.selectedSessionKey) {
+      loadChatHistory(state.selectedSessionKey);
+    }
+  } else if (data.state === 'error') {
+    state.chatStreaming = false;
+    state.chatRunId = null;
+    removeTypingIndicator();
+    const streamEl = chatThread.querySelector('.streaming-msg');
+    if (streamEl) streamEl.remove();
+    const errDiv = document.createElement('div');
+    errDiv.className = 'chat-msg system';
+    errDiv.textContent = `Error: ${data.errorMessage || 'chat error'}`;
+    chatThread.appendChild(errDiv);
+    scrollChatToBottom();
+  } else if (data.state === 'aborted') {
+    state.chatStreaming = false;
+    state.chatRunId = null;
+    finalizeStreamingMessage();
+  }
+}
+
+function extractMessageText(msg) {
+  if (!msg) return null;
+  const content = msg.content;
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const texts = content
+      .filter(p => p && p.type === 'text' && typeof p.text === 'string')
+      .map(p => p.text);
+    return texts.length > 0 ? texts.join('\n') : null;
+  }
+  return null;
 }
 
 function handleStream(msg) {
@@ -210,6 +286,7 @@ async function loadInitial() {
       wsRequest('agents.list', {}),
     ]);
     
+    console.log('[mobile] agents.list response:', JSON.stringify(agentsRes));
     if (agentsRes?.agents) {
       state.agents = agentsRes.agents;
       state.defaultAgentId = agentsRes.defaultId || agentsRes.agents[0]?.id;
@@ -279,8 +356,8 @@ async function loadAgentChat(agentId) {
         return;
       }
     }
-    // No existing session - ready for new chat
-    state.selectedSessionKey = `control:${agentId}:mobile-${Date.now()}`;
+    // No existing session - use standard session key format
+    state.selectedSessionKey = `agent:${agentId}:main`;
   } catch (e) {
     console.error('loadAgentChat', e);
   }
@@ -421,56 +498,34 @@ async function sendMessage() {
   state.streamingText = '';
   
   try {
+    const idempotencyKey = `mob-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    state.chatRunId = idempotencyKey;
+    
     const params = {
       message: text,
-      idempotencyKey: `mob-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
+      deliver: false,
+      idempotencyKey,
     };
+    
+    // Use a proper session key format
     if (state.selectedSessionKey) {
       params.sessionKey = state.selectedSessionKey;
+    } else {
+      // Create a session key in the standard format
+      params.sessionKey = 'main';
+      state.selectedSessionKey = 'main';
     }
     
     const res = await wsRequest('chat.send', params);
     
-    // If we get a direct response (non-streaming)
-    if (res) {
-      removeTypingIndicator();
-      state.chatStreaming = false;
-      
-      // The response might contain the session key
-      if (res.sessionKey) {
-        state.selectedSessionKey = res.sessionKey;
-      }
-      
-      // Response might have message directly
-      if (res.text || res.content || res.message) {
-        const content = res.text || res.content || (typeof res.message === 'string' ? res.message : res.message?.content || '');
-        if (content) {
-          const assistantMsg = { role: 'assistant', content, timestamp: Date.now() };
-          state.chatHistory.push(assistantMsg);
-          // Remove streaming msg if any
-          const streamEl = chatThread.querySelector('.streaming-msg');
-          if (streamEl) streamEl.remove();
-          
-          const d = document.createElement('div');
-          d.innerHTML = renderMessage(assistantMsg);
-          chatThread.appendChild(d.firstElementChild);
-          scrollChatToBottom();
-        }
-      }
-      
-      // If response has messages array, render the assistant reply
-      if (res.messages) {
-        for (const m of res.messages) {
-          if (m.role === 'assistant') {
-            state.chatHistory.push(m);
-            const d = document.createElement('div');
-            d.innerHTML = renderMessage(m);
-            chatThread.appendChild(d.firstElementChild);
-          }
-        }
-        scrollChatToBottom();
-      }
+    // chat.send returns an ack - the actual response comes via 'chat' events
+    // Track the session key from the response
+    if (res?.sessionKey) {
+      state.selectedSessionKey = res.sessionKey;
     }
+    
+    // The response is just an ack; content arrives via handleChatEvent
+    // If no streaming starts within 60s, the timeout in wsRequest handles it
   } catch (e) {
     removeTypingIndicator();
     state.chatStreaming = false;
