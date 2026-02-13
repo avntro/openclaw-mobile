@@ -52,14 +52,24 @@ function connect() {
   state.ws = ws;
   
   ws.addEventListener('open', () => {
-    // Send connect/auth
+    // Send connect/auth (must match gateway protocol schema)
     wsRequest('connect', {
-      clientId: 'openclaw-mobile',
-      clientMode: 'WEBCHAT',
+      minProtocol: 3,
+      maxProtocol: 3,
+      client: {
+        id: 'openclaw-mobile',
+        version: 'dev',
+        platform: navigator.platform || 'web',
+        mode: 'WEBCHAT',
+        instanceId: 'mobile-' + Math.random().toString(36).slice(2, 10),
+      },
       role: 'operator',
       scopes: ['operator', 'operator.control', 'operator.pairing'],
-      auth: { password: state.password },
+      device: null,
       caps: [],
+      auth: { password: state.password },
+      userAgent: navigator.userAgent,
+      locale: navigator.language,
     }).then(hello => {
       state.connected = true;
       setConnState('connected');

@@ -7,7 +7,7 @@ const path = require('path');
 const crypto = require('crypto');
 
 const PORT = parseInt(process.env.PORT || '8090', 10);
-const BIND = process.env.BIND || '0.0.0.0';
+const BIND = process.env.BIND || '127.0.0.1';
 const ROOT = __dirname;
 
 const MIME = {
