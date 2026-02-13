@@ -23,7 +23,14 @@ const state = {
   chatStreaming: false,
   streamingText: '',
   agentIdentities: {},
+  // Per-agent chat history cache
+  agentChatCache: {},
 };
+
+// Build the session key for an agent (matches gateway convention)
+function agentSessionKey(agentId) {
+  return `agent:${agentId}:mobile`;
+}
 
 const GATEWAY_HOST = location.hostname || 'pc1.taildb1204.ts.net';
 const GATEWAY_PORT = 443;
@@ -291,7 +298,10 @@ async function loadInitial() {
       state.agents = agentsRes.agents;
       state.defaultAgentId = agentsRes.defaultId || agentsRes.agents[0]?.id;
       state.selectedAgentId = state.defaultAgentId;
+      state.selectedSessionKey = agentSessionKey(state.selectedAgentId);
       renderAgentSelector();
+      // Load chat history for the default agent
+      loadChatHistory(state.selectedSessionKey);
       
       // Load identities
       for (const a of state.agents) {
@@ -319,7 +329,8 @@ function renderAgentSelector() {
     const identity = state.agentIdentities[a.id];
     const name = a.name || identity?.name || a.identity?.name || a.id;
     const active = a.id === state.selectedAgentId ? ' active' : '';
-    return `<button class="agent-chip${active}" data-agent="${a.id}">${escapeHtml(name)}</button>`;
+    const color = AGENT_COLORS[a.id] || 'var(--accent)';
+    return `<button class="agent-chip${active}" data-agent="${a.id}" style="${active ? `background:${color};color:#fff` : ''}">${escapeHtml(name)}</button>`;
   }).join('');
   
   agentSelector.querySelectorAll('.agent-chip').forEach(chip => {
@@ -328,38 +339,27 @@ function renderAgentSelector() {
 }
 
 function selectAgent(agentId) {
-  state.selectedAgentId = agentId;
-  state.selectedSessionKey = null;
-  state.chatHistory = [];
-  renderAgentSelector();
-  chatThread.innerHTML = '<div class="chat-empty">Send a message to start chatting</div>';
+  // Save current chat to cache
+  if (state.selectedAgentId && state.selectedSessionKey) {
+    state.agentChatCache[state.selectedAgentId] = {
+      sessionKey: state.selectedSessionKey,
+      history: [...state.chatHistory],
+    };
+  }
   
-  // Find or create session for this agent
-  loadAgentChat(agentId);
-}
-
-async function loadAgentChat(agentId) {
-  try {
-    // List sessions for this agent
-    const res = await wsRequest('sessions.list', { includeGlobal: false });
-    if (res?.sessions) {
-      // Find recent session for this agent
-      const agentSessions = res.sessions.filter(s => 
-        s.agentId === agentId && s.channel === 'control'
-      );
-      
-      if (agentSessions.length > 0) {
-        // Use most recent
-        const session = agentSessions[0];
-        state.selectedSessionKey = session.key;
-        await loadChatHistory(session.key);
-        return;
-      }
-    }
-    // No existing session - let gateway create one via chat.send
-    state.selectedSessionKey = null;
-  } catch (e) {
-    console.error('loadAgentChat', e);
+  state.selectedAgentId = agentId;
+  state.selectedSessionKey = agentSessionKey(agentId);
+  renderAgentSelector();
+  
+  // Restore from cache if available
+  const cached = state.agentChatCache[agentId];
+  if (cached && cached.sessionKey === state.selectedSessionKey && cached.history.length > 0) {
+    state.chatHistory = cached.history;
+    renderChat();
+  } else {
+    state.chatHistory = [];
+    chatThread.innerHTML = '<div class="chat-empty">Loading...</div>';
+    loadChatHistory(state.selectedSessionKey);
   }
 }
 
@@ -505,10 +505,8 @@ async function sendMessage() {
       message: text,
       deliver: false,
       idempotencyKey,
+      sessionKey: state.selectedSessionKey || agentSessionKey(state.selectedAgentId || 'main'),
     };
-    
-    // Use session key if we have one, otherwise use 'main' (gateway assigns proper key)
-    params.sessionKey = state.selectedSessionKey || 'main';
     
     const res = await wsRequest('chat.send', params);
     
