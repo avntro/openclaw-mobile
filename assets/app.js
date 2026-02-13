@@ -27,9 +27,11 @@ const state = {
   agentChatCache: {},
 };
 
-// Build the session key for an agent (matches gateway convention)
+// Build the session key for an agent (matches Control UI convention)
 function agentSessionKey(agentId) {
-  return `agent:${agentId}:mobile`;
+  // Default agent uses 'main', others use 'agent:{id}:main'
+  if (agentId === state.defaultAgentId) return 'main';
+  return `agent:${agentId}:main`;
 }
 
 const GATEWAY_HOST = location.hostname || 'pc1.taildb1204.ts.net';
@@ -158,9 +160,18 @@ function handleChatEvent(data) {
   
   // Check if this event is for our session
   // Allow if no session key filter or if it matches
+  // Gateway may normalize 'main' to 'agent:main:main', so check both
   if (data.sessionKey && state.selectedSessionKey && 
       data.sessionKey !== state.selectedSessionKey) {
-    return;
+    // Check if this is a normalized form of the same session
+    const selected = state.selectedSessionKey;
+    const incoming = data.sessionKey;
+    const isMatch = (selected === 'main' && incoming === `agent:${state.defaultAgentId || 'main'}:main`) ||
+                    incoming.startsWith('agent:') && selected.startsWith('agent:') && 
+                    incoming.split(':')[1] === selected.split(':')[1];
+    if (!isMatch) return;
+    // Update to the canonical key
+    state.selectedSessionKey = incoming;
   }
   
   // Check runId if we have one
