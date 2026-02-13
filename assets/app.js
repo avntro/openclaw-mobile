@@ -57,10 +57,10 @@ function connect() {
       minProtocol: 3,
       maxProtocol: 3,
       client: {
-        id: 'openclaw-mobile',
+        id: 'webchat-ui',
         version: 'dev',
         platform: navigator.platform || 'web',
-        mode: 'WEBCHAT',
+        mode: 'webchat',
         instanceId: 'mobile-' + Math.random().toString(36).slice(2, 10),
       },
       role: 'operator',

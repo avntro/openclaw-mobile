@@ -73,9 +73,13 @@ function handler(req, res) {
   
   try {
     const data = fs.readFileSync(filePath);
+    // Aggressive no-cache for HTML and JS to ensure updates reach users immediately
+    const noCache = ['.html', '.js', '.json'].includes(ext);
     res.writeHead(200, {
       'Content-Type': contentType,
-      'Cache-Control': ext === '.html' ? 'no-cache' : 'public, max-age=3600',
+      'Cache-Control': noCache ? 'no-cache, no-store, must-revalidate' : 'public, max-age=3600',
+      'Pragma': noCache ? 'no-cache' : '',
+      'Expires': noCache ? '0' : '',
       'X-Content-Type-Options': 'nosniff',
     });
     res.end(data);
