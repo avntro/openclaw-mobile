@@ -26,8 +26,8 @@ const state = {
 };
 
 const GATEWAY_HOST = location.hostname || 'pc1.taildb1204.ts.net';
-const GATEWAY_PORT = 18789;
-const WS_URL = `wss://${GATEWAY_HOST}:${GATEWAY_PORT}`;
+const GATEWAY_PORT = 443;
+const WS_URL = `wss://${GATEWAY_HOST}`;
 
 // ─── DOM refs ───
 const $ = id => document.getElementById(id);
@@ -317,9 +317,9 @@ const AGENT_COLORS = {
 function renderAgentSelector() {
   agentSelector.innerHTML = state.agents.map(a => {
     const identity = state.agentIdentities[a.id];
-    const name = identity?.name || a.id;
+    const name = a.name || identity?.name || a.identity?.name || a.id;
     const active = a.id === state.selectedAgentId ? ' active' : '';
-    return `<button class="agent-chip${active}" data-agent="${a.id}">${name}</button>`;
+    return `<button class="agent-chip${active}" data-agent="${a.id}">${escapeHtml(name)}</button>`;
   }).join('');
   
   agentSelector.querySelectorAll('.agent-chip').forEach(chip => {
@@ -356,8 +356,8 @@ async function loadAgentChat(agentId) {
         return;
       }
     }
-    // No existing session - use standard session key format
-    state.selectedSessionKey = `agent:${agentId}:main`;
+    // No existing session - let gateway create one via chat.send
+    state.selectedSessionKey = null;
   } catch (e) {
     console.error('loadAgentChat', e);
   }
@@ -507,14 +507,8 @@ async function sendMessage() {
       idempotencyKey,
     };
     
-    // Use a proper session key format
-    if (state.selectedSessionKey) {
-      params.sessionKey = state.selectedSessionKey;
-    } else {
-      // Create a session key in the standard format
-      params.sessionKey = 'main';
-      state.selectedSessionKey = 'main';
-    }
+    // Use session key if we have one, otherwise use 'main' (gateway assigns proper key)
+    params.sessionKey = state.selectedSessionKey || 'main';
     
     const res = await wsRequest('chat.send', params);
     
@@ -621,8 +615,8 @@ function renderAgentsList() {
   const el = $('agents-list');
   el.innerHTML = state.agents.map(a => {
     const identity = state.agentIdentities[a.id];
-    const name = identity?.name || a.name || a.id;
-    const description = identity?.about || identity?.description || a.identity?.name || a.name || a.id;
+    const name = a.name || identity?.name || a.id;
+    const description = identity?.about || identity?.description || a.name || a.id;
     const color = AGENT_COLORS[a.id] || 'var(--accent)';
     
     return `
@@ -714,7 +708,7 @@ function renderStatus() {
     <h3>🤖 Agents</h3>
     ${state.agents.map(a => {
       const identity = state.agentIdentities[a.id];
-      const name = identity?.name || a.name || a.id;
+      const name = a.name || identity?.name || a.id;
       return statusRow(name, `<span class="list-card-tag green" style="display:inline-block">ready</span>`);
     }).join('')}
   </div>`;
