@@ -15,6 +15,7 @@ const state = {
   selectedSessionKey: null,
   sessions: [],
   chatHistory: [],
+  hello: null,
   statusData: null,
   healthData: null,
   heartbeatData: null,
@@ -57,22 +58,28 @@ function connect() {
       minProtocol: 3,
       maxProtocol: 3,
       client: {
-        id: 'webchat-ui',
+        id: 'openclaw-control-ui',
         version: 'dev',
         platform: navigator.platform || 'web',
         mode: 'webchat',
         instanceId: 'mobile-' + Math.random().toString(36).slice(2, 10),
       },
       role: 'operator',
-      scopes: ['operator', 'operator.control', 'operator.pairing'],
-      device: null,
+      scopes: ['operator.admin', 'operator.approvals', 'operator.pairing'],
       caps: [],
       auth: { password: state.password },
       userAgent: navigator.userAgent,
       locale: navigator.language,
     }).then(hello => {
       state.connected = true;
+      state.hello = hello;
       setConnState('connected');
+      // Keepalive ping every 15s to prevent idle disconnect
+      state.pingInterval = setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ type: 'req', id: `ping${Date.now()}`, method: 'ping', params: {} }));
+        }
+      }, 15000);
       showMain();
       loadInitial();
     }).catch(err => {
@@ -90,6 +97,7 @@ function connect() {
 
   ws.addEventListener('close', () => {
     state.connected = false;
+    if (state.pingInterval) { clearInterval(state.pingInterval); state.pingInterval = null; }
     setConnState('disconnected');
     setTimeout(() => { if (state.password) connect(); }, 3000);
   });
@@ -105,7 +113,7 @@ function handleMessage(msg) {
       if (msg.type === 'err' || msg.error) {
         p.reject(new Error(msg.error?.message || msg.message || 'request failed'));
       } else {
-        p.resolve(msg.result ?? msg);
+        p.resolve(msg.result ?? msg.payload ?? msg);
       }
     }
   } else if (msg.type === 'event') {
@@ -414,8 +422,8 @@ async function sendMessage() {
   
   try {
     const params = {
-      agentId: state.selectedAgentId,
       message: text,
+      idempotencyKey: `mob-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`,
     };
     if (state.selectedSessionKey) {
       params.sessionKey = state.selectedSessionKey;
@@ -558,18 +566,16 @@ function renderAgentsList() {
   const el = $('agents-list');
   el.innerHTML = state.agents.map(a => {
     const identity = state.agentIdentities[a.id];
-    const name = identity?.name || a.id;
-    const model = a.model || identity?.model || '?';
+    const name = identity?.name || a.name || a.id;
+    const description = identity?.about || identity?.description || a.identity?.name || a.name || a.id;
     const color = AGENT_COLORS[a.id] || 'var(--accent)';
-    const status = a.status || 'idle';
-    const statusColor = status === 'busy' ? 'orange' : status === 'error' ? 'red' : 'green';
     
     return `
       <div class="list-card" data-agent-id="${escapeHtml(a.id)}">
         <div class="list-card-title" style="color:${color}">${escapeHtml(name)}</div>
-        <div class="list-card-sub">${escapeHtml(model)}</div>
+        <div class="list-card-sub">${escapeHtml(description)}</div>
         <div class="list-card-meta">
-          <span class="list-card-tag ${statusColor}">${escapeHtml(status)}</span>
+          <span class="list-card-tag green">ready</span>
           <span class="list-card-tag" style="background:${color}20;color:${color}">${escapeHtml(a.id)}</span>
         </div>
       </div>
@@ -607,23 +613,32 @@ function renderStatus() {
   const el = $('status-content');
   const s = state.statusData || {};
   const h = state.healthData || {};
+  const hello = state.hello || {};
+  const snapshot = hello.snapshot || {};
+  
+  // Resolve version from presence entries or hello
+  const selfPresence = (snapshot.presence || []).find(p => p.mode === 'gateway');
+  const version = selfPresence?.version || hello.version || 'unknown';
+  const uptimeMs = snapshot.uptimeMs;
+  const mode = selfPresence?.mode || 'gateway';
   
   let html = '';
   
   // Gateway info
   html += `<div class="status-card">
     <h3>⚡ Gateway</h3>
-    ${statusRow('Version', s.version || '?')}
-    ${statusRow('Uptime', s.uptime ? formatDuration(s.uptime) : '?')}
-    ${statusRow('Mode', s.mode || '?')}
-    ${statusRow('Agents', s.agents?.length || state.agents.length || '?')}
+    ${statusRow('Version', version)}
+    ${statusRow('Uptime', uptimeMs ? formatDuration(uptimeMs) : 'n/a')}
+    ${statusRow('Mode', mode)}
+    ${statusRow('Agents', state.agents.length || '?')}
   </div>`;
   
   // Health
   if (h) {
+    const isOk = h.status === 'ok' || h.ok || (h.memory && !h.error);
     html += `<div class="status-card">
       <h3>💚 Health</h3>
-      ${statusRow('Status', h.status || h.ok ? '✅ OK' : '⚠️ Issues')}
+      ${statusRow('Status', isOk ? '✅ OK' : '⚠️ Issues')}
       ${h.memory ? statusRow('Memory', formatBytes(h.memory.rss || h.memory.heapUsed || 0)) : ''}
       ${h.cpu ? statusRow('CPU', (h.cpu.usage || 0).toFixed(1) + '%') : ''}
     </div>`;
@@ -634,8 +649,8 @@ function renderStatus() {
     const hb = state.heartbeatData;
     html += `<div class="status-card">
       <h3>💓 Last Heartbeat</h3>
-      ${statusRow('Agent', hb.agentId || '?')}
-      ${statusRow('Time', hb.at ? timeAgo(hb.at) : '?')}
+      ${statusRow('Agent', hb.agentId || 'n/a')}
+      ${statusRow('Time', hb.at ? timeAgo(hb.at) : (hb.ts ? timeAgo(hb.ts) : 'n/a'))}
     </div>`;
   }
   
@@ -644,9 +659,8 @@ function renderStatus() {
     <h3>🤖 Agents</h3>
     ${state.agents.map(a => {
       const identity = state.agentIdentities[a.id];
-      const name = identity?.name || a.id;
-      const status = a.status || 'idle';
-      return statusRow(name, `<span class="list-card-tag ${status === 'busy' ? 'orange' : 'green'}" style="display:inline-block">${status}</span>`);
+      const name = identity?.name || a.name || a.id;
+      return statusRow(name, `<span class="list-card-tag green" style="display:inline-block">ready</span>`);
     }).join('')}
   </div>`;
   
