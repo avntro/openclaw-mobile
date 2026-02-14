@@ -1,4 +1,4 @@
-// OpenClaw Mobile Dashboard
+// OpenClaw Mobile Dashboard v2
 (function() {
 'use strict';
 
@@ -16,26 +16,24 @@ const state = {
   sessions: [],
   chatHistory: [],
   hello: null,
-  statusData: null,
-  healthData: null,
-  heartbeatData: null,
   currentView: 'chat',
   chatStreaming: false,
   streamingText: '',
   agentIdentities: {},
-  // Per-agent chat history cache
   agentChatCache: {},
+  cronJobs: [],
+  usageData: null,
+  models: [],
+  logLines: [],
+  logSubscribed: false,
 };
 
-// Build the session key for an agent (matches Control UI convention)
 function agentSessionKey(agentId) {
-  // Default agent uses 'main', others use 'agent:{id}:main'
   if (agentId === state.defaultAgentId) return 'main';
   return `agent:${agentId}:main`;
 }
 
 const GATEWAY_HOST = location.hostname || 'pc1.taildb1204.ts.net';
-const GATEWAY_PORT = 443;
 const WS_URL = `wss://${GATEWAY_HOST}`;
 
 // ─── DOM refs ───
@@ -62,7 +60,6 @@ function connect() {
   state.ws = ws;
   
   ws.addEventListener('open', () => {
-    // Send connect/auth (must match gateway protocol schema)
     wsRequest('connect', {
       minProtocol: 3,
       maxProtocol: 3,
@@ -83,7 +80,6 @@ function connect() {
       state.connected = true;
       state.hello = hello;
       setConnState('connected');
-      // Keepalive ping every 15s to prevent idle disconnect
       state.pingInterval = setInterval(() => {
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'req', id: `ping${Date.now()}`, method: 'ping', params: {} }));
@@ -94,7 +90,7 @@ function connect() {
     }).catch(err => {
       console.error('connect failed', err);
       setConnState('disconnected');
-      showLogin('Connection rejected');
+      showLogin('Connection rejected: ' + (err.message || 'unknown'));
     });
   });
 
@@ -126,7 +122,6 @@ function handleMessage(msg) {
       }
     }
   } else if (msg.type === 'event') {
-    // Skip connect.challenge events (handled by protocol)
     if (msg.event === 'connect.challenge') return;
     handleEvent(msg);
   } else if (msg.type === 'stream') {
@@ -138,8 +133,10 @@ function handleEvent(msg) {
   const evt = msg.event;
   const data = msg.payload || msg.data;
   
-  if (evt === 'chat') {
-    handleChatEvent(data);
+  if (evt === 'chat') { handleChatEvent(data); return; }
+  
+  if (evt === 'logs.entry' && state.currentView === 'logs') {
+    appendLogLine(data);
     return;
   }
   
@@ -153,28 +150,21 @@ function handleEvent(msg) {
 function handleChatEvent(data) {
   if (!data) return;
   
-  // Track session key from response
   if (data.sessionKey && state.chatStreaming) {
     state.selectedSessionKey = data.sessionKey;
   }
   
-  // Check if this event is for our session
-  // Allow if no session key filter or if it matches
-  // Gateway may normalize 'main' to 'agent:main:main', so check both
   if (data.sessionKey && state.selectedSessionKey && 
       data.sessionKey !== state.selectedSessionKey) {
-    // Check if this is a normalized form of the same session
     const selected = state.selectedSessionKey;
     const incoming = data.sessionKey;
     const isMatch = (selected === 'main' && incoming === `agent:${state.defaultAgentId || 'main'}:main`) ||
-                    incoming.startsWith('agent:') && selected.startsWith('agent:') && 
-                    incoming.split(':')[1] === selected.split(':')[1];
+                    (incoming.startsWith('agent:') && selected.startsWith('agent:') && 
+                    incoming.split(':')[1] === selected.split(':')[1]);
     if (!isMatch) return;
-    // Update to the canonical key
     state.selectedSessionKey = incoming;
   }
   
-  // Check runId if we have one
   if (data.runId && state.chatRunId && data.runId !== state.chatRunId) {
     if (data.state === 'final') return;
     return;
@@ -183,8 +173,7 @@ function handleChatEvent(data) {
   if (data.state === 'delta') {
     const text = extractMessageText(data.message);
     if (typeof text === 'string') {
-      const current = state.streamingText || '';
-      if (!current || text.length >= current.length) {
+      if (!state.streamingText || text.length >= state.streamingText.length) {
         state.streamingText = text;
       }
       updateStreamingMessage();
@@ -193,21 +182,14 @@ function handleChatEvent(data) {
     state.chatStreaming = false;
     state.chatRunId = null;
     finalizeStreamingMessage();
-    // Reload full history to get the complete message
-    if (state.selectedSessionKey) {
-      loadChatHistory(state.selectedSessionKey);
-    }
+    if (state.selectedSessionKey) loadChatHistory(state.selectedSessionKey);
   } else if (data.state === 'error') {
     state.chatStreaming = false;
     state.chatRunId = null;
     removeTypingIndicator();
     const streamEl = chatThread.querySelector('.streaming-msg');
     if (streamEl) streamEl.remove();
-    const errDiv = document.createElement('div');
-    errDiv.className = 'chat-msg system';
-    errDiv.textContent = `Error: ${data.errorMessage || 'chat error'}`;
-    chatThread.appendChild(errDiv);
-    scrollChatToBottom();
+    appendSystemMsg(`Error: ${data.errorMessage || 'chat error'}`);
   } else if (data.state === 'aborted') {
     state.chatStreaming = false;
     state.chatRunId = null;
@@ -220,22 +202,15 @@ function extractMessageText(msg) {
   const content = msg.content;
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
-    const texts = content
-      .filter(p => p && p.type === 'text' && typeof p.text === 'string')
-      .map(p => p.text);
-    return texts.length > 0 ? texts.join('\n') : null;
+    return content.filter(p => p?.type === 'text' && typeof p.text === 'string').map(p => p.text).join('\n') || null;
   }
   return null;
 }
 
 function handleStream(msg) {
-  // Handle streaming chat responses
   if (msg.event === 'chat.delta' || msg.delta) {
     const delta = msg.delta || msg.data?.delta || '';
-    if (delta) {
-      state.streamingText += delta;
-      updateStreamingMessage();
-    }
+    if (delta) { state.streamingText += delta; updateStreamingMessage(); }
   }
   if (msg.event === 'chat.done' || msg.done) {
     state.chatStreaming = false;
@@ -246,24 +221,25 @@ function handleStream(msg) {
 function wsRequest(method, params = {}) {
   return new Promise((resolve, reject) => {
     if (!state.ws || state.ws.readyState !== WebSocket.OPEN) {
-      return reject(new Error('not connected'));
+      return reject(new Error('Not connected'));
     }
     const id = `m${++state.reqId}`;
     state.pending[id] = { resolve, reject };
     state.ws.send(JSON.stringify({ type: 'req', id, method, params }));
-    // Timeout
     setTimeout(() => {
-      if (state.pending[id]) {
-        delete state.pending[id];
-        reject(new Error('timeout'));
-      }
+      if (state.pending[id]) { delete state.pending[id]; reject(new Error('Request timeout')); }
     }, 30000);
   });
 }
 
 // ─── Connection State UI ───
 function setConnState(s) {
-  connStatus.className = 'topbar-status ' + (s === 'connected' ? '' : s);
+  connStatus.className = 'topbar-status ' + s;
+  const label = $('conn-label');
+  if (label) {
+    label.textContent = s === 'connected' ? 'Connected' : s === 'connecting' ? 'Connecting...' : 'Disconnected';
+    label.className = 'conn-label ' + s;
+  }
 }
 
 // ─── Screen Management ───
@@ -281,10 +257,7 @@ function showMain() {
 
 // ─── Navigation ───
 document.querySelectorAll('.nav-item').forEach(btn => {
-  btn.addEventListener('click', () => {
-    const view = btn.dataset.view;
-    switchView(view);
-  });
+  btn.addEventListener('click', () => switchView(btn.dataset.view));
 });
 
 function switchView(view) {
@@ -300,27 +273,18 @@ function switchView(view) {
 // ─── Initial Load ───
 async function loadInitial() {
   try {
-    const [agentsRes] = await Promise.all([
-      wsRequest('agents.list', {}),
-    ]);
-    
-    console.log('[mobile] agents.list response:', JSON.stringify(agentsRes));
+    const agentsRes = await wsRequest('agents.list', {});
     if (agentsRes?.agents) {
       state.agents = agentsRes.agents;
       state.defaultAgentId = agentsRes.defaultId || agentsRes.agents[0]?.id;
       state.selectedAgentId = state.defaultAgentId;
       state.selectedSessionKey = agentSessionKey(state.selectedAgentId);
       renderAgentSelector();
-      // Load chat history for the default agent
       loadChatHistory(state.selectedSessionKey);
       
-      // Load identities
       for (const a of state.agents) {
         wsRequest('agent.identity.get', { agentId: a.id }).then(identity => {
-          if (identity) {
-            state.agentIdentities[a.id] = identity;
-            renderAgentSelector();
-          }
+          if (identity) { state.agentIdentities[a.id] = identity; renderAgentSelector(); }
         }).catch(() => {});
       }
     }
@@ -335,13 +299,17 @@ const AGENT_COLORS = {
   dev: 'var(--orange)', voice: 'var(--pink)', troubleshoot: 'var(--red)',
 };
 
+function getAgentName(a) {
+  const identity = state.agentIdentities[a.id];
+  return a.name || identity?.name || a.identity?.name || a.id;
+}
+
 function renderAgentSelector() {
   agentSelector.innerHTML = state.agents.map(a => {
-    const identity = state.agentIdentities[a.id];
-    const name = a.name || identity?.name || a.identity?.name || a.id;
+    const name = getAgentName(a);
     const active = a.id === state.selectedAgentId ? ' active' : '';
     const color = AGENT_COLORS[a.id] || 'var(--accent)';
-    return `<button class="agent-chip${active}" data-agent="${a.id}" style="${active ? `background:${color};color:#fff` : ''}">${escapeHtml(name)}</button>`;
+    return `<button class="agent-chip${active}" data-agent="${a.id}" style="${active ? `background:${color};color:#fff` : ''}">${esc(name)}</button>`;
   }).join('');
   
   agentSelector.querySelectorAll('.agent-chip').forEach(chip => {
@@ -350,7 +318,6 @@ function renderAgentSelector() {
 }
 
 function selectAgent(agentId) {
-  // Save current chat to cache
   if (state.selectedAgentId && state.selectedSessionKey) {
     state.agentChatCache[state.selectedAgentId] = {
       sessionKey: state.selectedSessionKey,
@@ -362,14 +329,13 @@ function selectAgent(agentId) {
   state.selectedSessionKey = agentSessionKey(agentId);
   renderAgentSelector();
   
-  // Restore from cache if available
   const cached = state.agentChatCache[agentId];
   if (cached && cached.sessionKey === state.selectedSessionKey && cached.history.length > 0) {
     state.chatHistory = cached.history;
     renderChat();
   } else {
     state.chatHistory = [];
-    chatThread.innerHTML = '<div class="chat-empty">Loading...</div>';
+    chatThread.innerHTML = '<div class="chat-empty"><div class="loading-spinner"></div>Loading...</div>';
     loadChatHistory(state.selectedSessionKey);
   }
 }
@@ -384,7 +350,6 @@ async function loadChatHistory(sessionKey) {
     }
   } catch (e) {
     console.error('loadChatHistory', e);
-    // Session might not support history
   }
 }
 
@@ -393,7 +358,6 @@ function renderChat() {
     chatThread.innerHTML = '<div class="chat-empty">Send a message to start chatting</div>';
     return;
   }
-  
   chatThread.innerHTML = state.chatHistory.map(m => renderMessage(m)).join('');
   scrollChatToBottom();
 }
@@ -401,38 +365,24 @@ function renderChat() {
 function renderMessage(msg) {
   const role = msg.role || 'assistant';
   if (role === 'system') {
-    return `<div class="chat-msg system">${escapeHtml(truncateText(msg.content || '', 200))}</div>`;
+    return `<div class="chat-msg system">${esc(truncate(msg.content || '', 200))}</div>`;
   }
-  
-  const content = formatMessageContent(msg.content || '');
+  const content = formatContent(msg.content || '');
   const time = msg.timestamp ? formatTime(msg.timestamp) : '';
   const meta = time ? `<div class="msg-meta">${time}</div>` : '';
-  
   return `<div class="chat-msg ${role}">${content}${meta}</div>`;
 }
 
-function formatMessageContent(text) {
-  // Strip thinking tags
+function formatContent(text) {
   text = text.replace(/<\/?(?:think(?:ing)?|thought|antthinking)\b[^>]*>/gi, '');
   text = text.trim();
   if (!text) return '<em>thinking...</em>';
-  
-  // Basic markdown: code blocks, inline code, bold, italic, links
-  // Code blocks
-  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => 
-    `<pre><code>${escapeHtml(code.trim())}</code></pre>`
-  );
-  // Inline code
+  text = text.replace(/```(\w*)\n?([\s\S]*?)```/g, (_, lang, code) => `<pre><code>${esc(code.trim())}</code></pre>`);
   text = text.replace(/`([^`]+)`/g, '<code>$1</code>');
-  // Bold
   text = text.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-  // Italic
   text = text.replace(/\*(.+?)\*/g, '<em>$1</em>');
-  // Links
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
-  // Line breaks (but not inside pre)
   text = text.replace(/\n/g, '<br>');
-  
   return text;
 }
 
@@ -445,6 +395,14 @@ function appendMessageFromEvent(data) {
   scrollChatToBottom();
 }
 
+function appendSystemMsg(text) {
+  const div = document.createElement('div');
+  div.className = 'chat-msg system';
+  div.textContent = text;
+  chatThread.appendChild(div);
+  scrollChatToBottom();
+}
+
 function updateStreamingMessage() {
   let el = chatThread.querySelector('.streaming-msg');
   if (!el) {
@@ -452,7 +410,7 @@ function updateStreamingMessage() {
     el.className = 'chat-msg assistant streaming-msg';
     chatThread.appendChild(el);
   }
-  el.innerHTML = formatMessageContent(state.streamingText);
+  el.innerHTML = formatContent(state.streamingText);
   scrollChatToBottom();
 }
 
@@ -473,7 +431,7 @@ function addTypingIndicator() {
   const el = document.createElement('div');
   el.className = 'typing-indicator';
   el.id = 'typing';
-  el.textContent = 'Thinking...';
+  el.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div>';
   chatThread.appendChild(el);
   scrollChatToBottom();
 }
@@ -491,11 +449,9 @@ async function sendMessage() {
   autoResize();
   btnSend.disabled = true;
   
-  // Show user message immediately
   const userMsg = { role: 'user', content: text, timestamp: Date.now() };
   state.chatHistory.push(userMsg);
   
-  // Clear empty state
   const empty = chatThread.querySelector('.chat-empty');
   if (empty) empty.remove();
   
@@ -512,54 +468,40 @@ async function sendMessage() {
     const idempotencyKey = `mob-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     state.chatRunId = idempotencyKey;
     
-    const params = {
+    const res = await wsRequest('chat.send', {
       message: text,
       deliver: false,
       idempotencyKey,
       sessionKey: state.selectedSessionKey || agentSessionKey(state.selectedAgentId || 'main'),
-    };
+    });
     
-    const res = await wsRequest('chat.send', params);
-    
-    // chat.send returns an ack - the actual response comes via 'chat' events
-    // Track the session key from the response
-    if (res?.sessionKey) {
-      state.selectedSessionKey = res.sessionKey;
-    }
-    
-    // The response is just an ack; content arrives via handleChatEvent
-    // If no streaming starts within 60s, the timeout in wsRequest handles it
+    if (res?.sessionKey) state.selectedSessionKey = res.sessionKey;
   } catch (e) {
     removeTypingIndicator();
     state.chatStreaming = false;
-    console.error('chat.send failed', e);
-    // Show error
-    const errDiv = document.createElement('div');
-    errDiv.className = 'chat-msg system';
-    errDiv.textContent = `Error: ${e.message}`;
-    chatThread.appendChild(errDiv);
-    scrollChatToBottom();
+    appendSystemMsg(`Failed to send: ${e.message}`);
   }
-  
   updateSendButton();
 }
 
 function scrollChatToBottom() {
-  requestAnimationFrame(() => {
-    chatThread.scrollTop = chatThread.scrollHeight;
-  });
+  requestAnimationFrame(() => { chatThread.scrollTop = chatThread.scrollHeight; });
 }
 
 // ─── Sessions ───
 async function loadSessions() {
+  const el = $('sessions-list');
+  el.innerHTML = '<div class="list-empty"><div class="loading-spinner"></div>Loading sessions...</div>';
   try {
-    const res = await wsRequest('sessions.list', { includeGlobal: true, limit: 50 });
+    const res = await wsRequest('sessions.list', { includeGlobal: true, limit: 100 });
     if (res?.sessions) {
       state.sessions = res.sessions;
       renderSessions();
+    } else {
+      el.innerHTML = '<div class="list-empty">No sessions data</div>';
     }
   } catch (e) {
-    $('sessions-list').innerHTML = `<div class="list-empty">Error: ${escapeHtml(e.message)}</div>`;
+    el.innerHTML = `<div class="list-empty">Error: ${esc(e.message)}</div>`;
   }
 }
 
@@ -570,28 +512,38 @@ function renderSessions() {
     return;
   }
   
-  el.innerHTML = state.sessions.map(s => {
-    const label = s.label || s.key || 'Unknown';
-    const agent = s.agentId || '?';
+  // Sort by last activity (most recent first)
+  const sorted = [...state.sessions].sort((a, b) => {
+    const ta = a.lastActiveAt || a.updatedAt || a.createdAt || 0;
+    const tb = b.lastActiveAt || b.updatedAt || b.createdAt || 0;
+    return new Date(tb) - new Date(ta);
+  });
+  
+  el.innerHTML = sorted.map(s => {
+    const key = s.key || '';
+    const label = s.label || key;
+    const agent = s.agentId || key.split(':')[1] || '?';
     const channel = s.channel || '?';
-    const lastActive = s.lastActiveAt ? timeAgo(s.lastActiveAt) : 'unknown';
-    const msgs = s.messageCount ?? s.turns ?? '?';
-    
+    const lastActive = s.lastActiveAt || s.updatedAt;
+    const lastStr = lastActive ? timeAgo(lastActive) : 'unknown';
+    const turns = s.turns ?? s.messageCount ?? '?';
+    const tokens = s.tokenCount ?? s.totalTokens;
+    const tokenStr = tokens ? formatNumber(tokens) + ' tok' : '';
     const agentColor = AGENT_COLORS[agent] || 'var(--accent)';
+    const isActive = key === state.selectedSessionKey;
     
     return `
-      <div class="list-card" data-session-key="${escapeHtml(s.key || '')}">
-        <div class="list-card-title">${escapeHtml(truncateText(label, 60))}</div>
-        <div class="list-card-sub">${escapeHtml(channel)} · ${lastActive}</div>
+      <div class="list-card${isActive ? ' active-card' : ''}" data-session-key="${esc(key)}">
+        <div class="list-card-title">${esc(truncate(label, 60))}</div>
+        <div class="list-card-sub">${esc(channel)} · ${lastStr}</div>
         <div class="list-card-meta">
-          <span class="list-card-tag" style="background:${agentColor}20;color:${agentColor}">${escapeHtml(agent)}</span>
-          <span class="list-card-tag blue">${msgs} msgs</span>
+          <span class="list-card-tag" style="background:${agentColor}20;color:${agentColor}">${esc(agent)}</span>
+          ${turns !== '?' ? `<span class="list-card-tag blue">${turns} turns</span>` : ''}
+          ${tokenStr ? `<span class="list-card-tag orange">${tokenStr}</span>` : ''}
         </div>
-      </div>
-    `;
+      </div>`;
   }).join('');
   
-  // Click to load session in chat
   el.querySelectorAll('.list-card').forEach(card => {
     card.addEventListener('click', () => {
       const key = card.dataset.sessionKey;
@@ -609,41 +561,54 @@ function renderSessions() {
 
 // ─── Agents ───
 async function loadAgents() {
+  const el = $('agents-list');
+  el.innerHTML = '<div class="list-empty"><div class="loading-spinner"></div>Loading agents...</div>';
   try {
-    const res = await wsRequest('agents.list', {});
-    if (res?.agents) {
-      state.agents = res.agents;
+    const [agentsRes, modelsRes] = await Promise.all([
+      wsRequest('agents.list', {}),
+      wsRequest('models.list', {}).catch(() => null),
+    ]);
+    
+    if (agentsRes?.agents) {
+      state.agents = agentsRes.agents;
+      if (modelsRes?.models) state.models = modelsRes.models;
       renderAgentsList();
     }
   } catch (e) {
-    $('agents-list').innerHTML = `<div class="list-empty">Error: ${escapeHtml(e.message)}</div>`;
+    el.innerHTML = `<div class="list-empty">Error: ${esc(e.message)}</div>`;
   }
 }
 
 function renderAgentsList() {
   const el = $('agents-list');
+  
   el.innerHTML = state.agents.map(a => {
     const identity = state.agentIdentities[a.id];
-    const name = a.name || identity?.name || a.id;
-    const description = identity?.about || identity?.description || a.name || a.id;
+    const name = getAgentName(a);
+    const about = identity?.about || identity?.description || '';
+    const model = a.model || 'default';
+    const modelShort = model.split('/').pop().replace(/-\d{8}$/, '');
     const color = AGENT_COLORS[a.id] || 'var(--accent)';
     
     return `
-      <div class="list-card" data-agent-id="${escapeHtml(a.id)}">
-        <div class="list-card-title" style="color:${color}">${escapeHtml(name)}</div>
-        <div class="list-card-sub">${escapeHtml(description)}</div>
+      <div class="list-card" data-agent-id="${esc(a.id)}">
+        <div class="list-card-header">
+          <div class="agent-avatar" style="background:${color}">${name.charAt(0).toUpperCase()}</div>
+          <div class="list-card-header-text">
+            <div class="list-card-title">${esc(name)}</div>
+            <div class="list-card-sub">${esc(about || a.id)}</div>
+          </div>
+        </div>
         <div class="list-card-meta">
           <span class="list-card-tag green">ready</span>
-          <span class="list-card-tag" style="background:${color}20;color:${color}">${escapeHtml(a.id)}</span>
+          <span class="list-card-tag" style="background:${color}20;color:${color}">${esc(modelShort)}</span>
         </div>
-      </div>
-    `;
+      </div>`;
   }).join('');
   
   el.querySelectorAll('.list-card').forEach(card => {
     card.addEventListener('click', () => {
-      const id = card.dataset.agentId;
-      selectAgent(id);
+      selectAgent(card.dataset.agentId);
       switchView('chat');
     });
   });
@@ -651,97 +616,182 @@ function renderAgentsList() {
 
 // ─── Status ───
 async function loadStatus() {
+  const el = $('status-content');
+  el.innerHTML = '<div class="list-empty"><div class="loading-spinner"></div>Loading status...</div>';
+  
   try {
-    const [status, health, heartbeat] = await Promise.all([
-      wsRequest('status', {}),
-      wsRequest('health', {}).catch(() => null),
-      wsRequest('last-heartbeat', {}).catch(() => null),
+    const [sessionsRes, cronRes, usageRes, channelsRes] = await Promise.all([
+      wsRequest('sessions.list', { includeGlobal: true, limit: 200 }).catch(() => null),
+      wsRequest('cron.status', {}).catch(() => null),
+      wsRequest('sessions.usage', {}).catch(() => null),
+      wsRequest('channels.status', {}).catch(() => null),
     ]);
     
-    state.statusData = status;
-    state.healthData = health;
-    state.heartbeatData = heartbeat;
-    renderStatus();
+    renderStatusPage({
+      sessions: sessionsRes,
+      cron: cronRes,
+      usage: usageRes,
+      channels: channelsRes,
+    });
   } catch (e) {
-    $('status-content').innerHTML = `<div class="list-empty">Error: ${escapeHtml(e.message)}</div>`;
+    el.innerHTML = `<div class="list-empty">Error: ${esc(e.message)}</div>`;
   }
 }
 
-function renderStatus() {
+function renderStatusPage(data) {
   const el = $('status-content');
-  const s = state.statusData || {};
-  const h = state.healthData || {};
   const hello = state.hello || {};
   const snapshot = hello.snapshot || {};
   
-  // Resolve version from presence entries or hello
+  // Gateway info from hello/snapshot
   const selfPresence = (snapshot.presence || []).find(p => p.mode === 'gateway');
-  const version = selfPresence?.version || hello.version || 'unknown';
-  const uptimeMs = snapshot.uptimeMs;
-  const mode = selfPresence?.mode || 'gateway';
+  const version = hello.version || selfPresence?.version || snapshot.version || '?';
+  const uptimeMs = snapshot.uptimeMs || hello.uptimeMs;
+  
+  // Session stats
+  const sessions = data.sessions?.sessions || [];
+  const activeSessions = sessions.filter(s => {
+    const lastActive = s.lastActiveAt || s.updatedAt;
+    if (!lastActive) return false;
+    return (Date.now() - new Date(lastActive).getTime()) < 24 * 60 * 60 * 1000;
+  });
+  
+  // Usage stats
+  const usage = data.usage || {};
+  const totalTokens = usage.totalTokens || usage.tokens || 0;
+  const totalCost = usage.totalCost || usage.cost || 0;
+  
+  // Cron
+  const cron = data.cron || {};
+  const cronJobs = cron.jobs || cron.entries || [];
+  const cronActive = Array.isArray(cronJobs) ? cronJobs.length : 0;
+  
+  // Channels
+  const channels = data.channels;
   
   let html = '';
   
-  // Gateway info
+  // Gateway card
   html += `<div class="status-card">
     <h3>⚡ Gateway</h3>
-    ${statusRow('Version', version)}
-    ${statusRow('Uptime', uptimeMs ? formatDuration(uptimeMs) : 'n/a')}
-    ${statusRow('Mode', mode)}
-    ${statusRow('Agents', state.agents.length || '?')}
+    ${sRow('Version', version)}
+    ${sRow('Uptime', uptimeMs ? formatDuration(uptimeMs) : (snapshot.startedAt ? timeAgo(snapshot.startedAt) : '?'))}
+    ${sRow('Agents', state.agents.length)}
+    ${sRow('Sessions', sessions.length + ' total')}
+    ${sRow('Active (24h)', activeSessions.length)}
   </div>`;
   
-  // Health
-  if (h) {
-    const isOk = h.status === 'ok' || h.ok || (h.memory && !h.error);
+  // Usage card
+  if (totalTokens || totalCost) {
     html += `<div class="status-card">
-      <h3>💚 Health</h3>
-      ${statusRow('Status', isOk ? '✅ OK' : '⚠️ Issues')}
-      ${h.memory ? statusRow('Memory', formatBytes(h.memory.rss || h.memory.heapUsed || 0)) : ''}
-      ${h.cpu ? statusRow('CPU', (h.cpu.usage || 0).toFixed(1) + '%') : ''}
+      <h3>📊 Usage</h3>
+      ${totalTokens ? sRow('Tokens', formatNumber(totalTokens)) : ''}
+      ${totalCost ? sRow('Cost', '$' + totalCost.toFixed(2)) : ''}
     </div>`;
   }
   
-  // Heartbeat
-  if (state.heartbeatData) {
-    const hb = state.heartbeatData;
+  // Channels card
+  if (channels) {
     html += `<div class="status-card">
-      <h3>💓 Last Heartbeat</h3>
-      ${statusRow('Agent', hb.agentId || 'n/a')}
-      ${statusRow('Time', hb.at ? timeAgo(hb.at) : (hb.ts ? timeAgo(hb.ts) : 'n/a'))}
-    </div>`;
+      <h3>📡 Channels</h3>`;
+    if (Array.isArray(channels)) {
+      channels.forEach(ch => {
+        const statusIcon = ch.connected || ch.status === 'connected' ? '🟢' : '🔴';
+        html += sRow(ch.type || ch.name || ch.id || 'unknown', statusIcon + ' ' + (ch.status || 'unknown'));
+      });
+    } else if (typeof channels === 'object') {
+      Object.entries(channels).forEach(([k, v]) => {
+        const status = typeof v === 'object' ? (v.connected ? '🟢 connected' : v.status || '?') : v;
+        html += sRow(k, status);
+      });
+    }
+    html += '</div>';
   }
   
-  // Agents summary
+  // Cron card
+  if (cronActive > 0 || cron.nextRun) {
+    html += `<div class="status-card">
+      <h3>⏰ Cron</h3>
+      ${sRow('Active Jobs', cronActive)}
+      ${cron.nextRun ? sRow('Next Run', timeAgo(cron.nextRun)) : ''}
+    </div>`;
+    
+    if (Array.isArray(cronJobs) && cronJobs.length > 0) {
+      html += `<div class="status-card"><h3>📋 Cron Jobs</h3>`;
+      cronJobs.forEach(job => {
+        const name = job.name || job.id || 'unnamed';
+        const schedule = job.schedule || job.cron || '';
+        const lastRun = job.lastRun || job.lastRunAt;
+        html += `<div class="cron-job">
+          <div class="cron-job-name">${esc(name)}</div>
+          <div class="cron-job-detail">${esc(schedule)}${lastRun ? ' · last: ' + timeAgo(lastRun) : ''}</div>
+        </div>`;
+      });
+      html += '</div>';
+    }
+  }
+  
+  // Agents card
   html += `<div class="status-card">
     <h3>🤖 Agents</h3>
     ${state.agents.map(a => {
-      const identity = state.agentIdentities[a.id];
-      const name = a.name || identity?.name || a.id;
-      return statusRow(name, `<span class="list-card-tag green" style="display:inline-block">ready</span>`);
+      const name = getAgentName(a);
+      const model = (a.model || 'default').split('/').pop().replace(/-\d{8}$/, '');
+      const color = AGENT_COLORS[a.id] || 'var(--accent)';
+      return sRow(
+        `<span style="color:${color}">${esc(name)}</span>`,
+        `<span class="list-card-tag green" style="display:inline-block;font-size:0.7rem">ready</span> <span style="color:var(--muted);font-size:0.75rem">${esc(model)}</span>`
+      );
     }).join('')}
+  </div>`;
+  
+  // Connection info
+  html += `<div class="status-card">
+    <h3>🔌 Connection</h3>
+    ${sRow('Protocol', hello.protocol || '?')}
+    ${sRow('Client', 'Mobile Dashboard')}
+    ${sRow('Gateway', GATEWAY_HOST)}
   </div>`;
   
   el.innerHTML = html;
 }
 
-function statusRow(label, value) {
+function sRow(label, value) {
   return `<div class="status-row"><span class="status-label">${label}</span><span class="status-value">${value}</span></div>`;
 }
 
+// ─── Log viewer ───
+function appendLogLine(data) {
+  if (!data) return;
+  const line = typeof data === 'string' ? data : (data.message || data.line || JSON.stringify(data));
+  state.logLines.push({ text: line, ts: Date.now(), level: data.level });
+  if (state.logLines.length > 500) state.logLines.shift();
+  if (state.currentView === 'logs') renderLogs();
+}
+
+function renderLogs() {
+  const el = $('logs-content');
+  if (!el) return;
+  el.innerHTML = state.logLines.slice(-100).map(l => {
+    const lvl = l.level || 'info';
+    const cls = lvl === 'error' ? 'log-error' : lvl === 'warn' ? 'log-warn' : '';
+    return `<div class="log-line ${cls}">${esc(l.text)}</div>`;
+  }).join('');
+  el.scrollTop = el.scrollHeight;
+}
+
 // ─── Helpers ───
-function escapeHtml(s) {
+function esc(s) {
   if (!s) return '';
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-function truncateText(s, max) {
+function truncate(s, max) {
   return s.length > max ? s.slice(0, max - 1) + '…' : s;
 }
 
 function formatTime(ts) {
-  const d = new Date(ts);
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function timeAgo(ts) {
@@ -758,10 +808,18 @@ function timeAgo(ts) {
 function formatDuration(ms) {
   if (typeof ms === 'string') return ms;
   const secs = Math.floor(ms / 1000);
-  const h = Math.floor(secs / 3600);
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
   const m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+function formatNumber(n) {
+  if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+  if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+  return String(n);
 }
 
 function formatBytes(b) {
@@ -780,16 +838,9 @@ function updateSendButton() {
   btnSend.disabled = !chatInput.value.trim() || !state.connected;
 }
 
-chatInput.addEventListener('input', () => {
-  autoResize();
-  updateSendButton();
-});
-
+chatInput.addEventListener('input', () => { autoResize(); updateSendButton(); });
 chatInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) {
-    e.preventDefault();
-    sendMessage();
-  }
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
 });
 
 btnSend.addEventListener('click', sendMessage);
@@ -812,10 +863,7 @@ loginForm.addEventListener('submit', e => {
 });
 
 // ─── Init ───
-if (state.password) {
-  connect();
-} else {
-  showLogin();
-}
+if (state.password) connect();
+else showLogin();
 
 })();
